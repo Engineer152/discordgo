@@ -6,41 +6,75 @@
 // license that can be found in the LICENSE file.
 
 // This file contains high level helper functions and easy entry points for the
-// entire discordgo package.  These functions are beling developed and are very
-// experimental at this point.  They will most likley change so please use the
+// entire discordgo package.  These functions are being developed and are very
+// experimental at this point.  They will most likely change so please use the
 // low level functions if that's a problem.
 
 // Package discordgo provides Discord binding for Go
 package discordgo
 
 import (
+	"errors"
 	"fmt"
-	"reflect"
+	"net/http"
+	"runtime"
+	"time"
 )
 
-// VERSION of Discordgo, follows Symantic Versioning. (http://semver.org/)
-const VERSION = "0.12.1"
+// VERSION of DiscordGo, follows Semantic Versioning. (http://semver.org/)
+const VERSION = "0.23.0"
+
+// ErrMFA will be risen by New when the user has 2FA.
+var ErrMFA = errors.New("account has 2FA enabled")
 
 // New creates a new Discord session and will automate some startup
 // tasks if given enough information to do so.  Currently you can pass zero
 // arguments and it will return an empty Discord session.
 // There are 3 ways to call New:
-//     With a single auth token - All requests will use the token blindly,
+//     With a single auth token - All requests will use the token blindly
+//         (just tossing it into the HTTP Authorization header);
 //         no verification of the token will be done and requests may fail.
+//         IF THE TOKEN IS FOR A BOT, IT MUST BE PREFIXED WITH `BOT `
+//         eg: `"Bot <token>"`
+//         IF IT IS AN OAUTH2 ACCESS TOKEN, IT MUST BE PREFIXED WITH `Bearer `
+//         eg: `"Bearer <token>"`
 //     With an email and password - Discord will sign in with the provided
 //         credentials.
 //     With an email, password and auth token - Discord will verify the auth
 //         token, if it is invalid it will sign in with the provided
 //         credentials. This is the Discord recommended way to sign in.
+//
+// NOTE: While email/pass authentication is supported by DiscordGo it is
+// HIGHLY DISCOURAGED by Discord. Please only use email/pass to obtain a token
+// and then use that authentication token for all future connections.
+// Also, doing any form of automation with a user (non Bot) account may result
+// in that account being permanently banned from Discord.
 func New(args ...interface{}) (s *Session, err error) {
 
 	// Create an empty Session interface.
 	s = &Session{
 		State:                  NewState(),
+		Ratelimiter:            NewRatelimiter(),
 		StateEnabled:           true,
 		Compress:               true,
 		ShouldReconnectOnError: true,
+		ShardID:                0,
+		ShardCount:             1,
+		MaxRestRetries:         3,
+		Client:                 &http.Client{Timeout: (20 * time.Second)},
+		UserAgent:              "DiscordBot (https://github.com/bwmarrin/discordgo, v" + VERSION + ")",
+		sequence:               new(int64),
+		LastHeartbeatAck:       time.Now().UTC(),
 	}
+
+	// Initilize the Identify Package with defaults
+	// These can be modified prior to calling Open()
+	s.Identify.Compress = true
+	s.Identify.LargeThreshold = 250
+	s.Identify.GuildSubscriptions = true
+	s.Identify.Properties.OS = runtime.GOOS
+	s.Identify.Properties.Browser = "DiscordGo v" + VERSION
+	s.Identify.Intents = MakeIntent(IntentsAllWithoutPrivileged)
 
 	// If no arguments are passed return the empty Session interface.
 	if args == nil {
@@ -57,7 +91,7 @@ func New(args ...interface{}) (s *Session, err error) {
 
 		case []string:
 			if len(v) > 3 {
-				err = fmt.Errorf("Too many string parameters provided.")
+				err = fmt.Errorf("too many string parameters provided")
 				return
 			}
 
@@ -73,7 +107,8 @@ func New(args ...interface{}) (s *Session, err error) {
 
 			// If third string exists, it must be an auth token.
 			if len(v) > 2 {
-				s.Token = v[2]
+				s.Identify.Token = v[2]
+				s.Token = v[2] // TODO: Remove, Deprecated - Kept for backwards compatibility.
 			}
 
 		case string:
@@ -86,9 +121,10 @@ func New(args ...interface{}) (s *Session, err error) {
 			} else if pass == "" {
 				pass = v
 			} else if s.Token == "" {
-				s.Token = v
+				s.Identify.Token = v
+				s.Token = v // TODO: Remove, Deprecated - Kept for backwards compatibility.
 			} else {
-				err = fmt.Errorf("Too many string parameters provided.")
+				err = fmt.Errorf("too many string parameters provided")
 				return
 			}
 
@@ -96,7 +132,7 @@ func New(args ...interface{}) (s *Session, err error) {
 			// TODO: Parse configuration struct
 
 		default:
-			err = fmt.Errorf("Unsupported parameter type provided.")
+			err = fmt.Errorf("unsupported parameter type provided")
 			return
 		}
 	}
@@ -106,136 +142,20 @@ func New(args ...interface{}) (s *Session, err error) {
 	// Discord will verify it for free, or log the user in if it is
 	// invalid.
 	if pass == "" {
-		s.Token = auth
+		s.Identify.Token = auth
+		s.Token = auth // TODO: Remove, Deprecated - Kept for backwards compatibility.
 	} else {
 		err = s.Login(auth, pass)
-		if err != nil || s.Token == "" {
-			err = fmt.Errorf("Unable to fetch discord authentication token. %v", err)
+		// TODO: Remove last s.Token part, Deprecated - Kept for backwards compatibility.
+		if err != nil || s.Identify.Token == "" || s.Token == "" {
+			if s.MFA {
+				err = ErrMFA
+			} else {
+				err = fmt.Errorf("Unable to fetch discord authentication token. %v", err)
+			}
 			return
 		}
 	}
 
-	// The Session is now able to have RestAPI methods called on it.
-	// It is recommended that you now call Open() so that events will trigger.
-
 	return
-}
-
-// validateHandler takes an event handler func, and returns the type of event.
-// eg.
-//     Session.validateHandler(func (s *discordgo.Session, m *discordgo.MessageCreate))
-//     will return the reflect.Type of *discordgo.MessageCreate
-func (s *Session) validateHandler(handler interface{}) reflect.Type {
-
-	handlerType := reflect.TypeOf(handler)
-
-	if handlerType.NumIn() != 2 {
-		panic("Unable to add event handler, handler must be of the type func(*discordgo.Session, *discordgo.EventType).")
-	}
-
-	if handlerType.In(0) != reflect.TypeOf(s) {
-		panic("Unable to add event handler, first argument must be of type *discordgo.Session.")
-	}
-
-	eventType := handlerType.In(1)
-
-	// Support handlers of type interface{}, this is a special handler, which is triggered on every event.
-	if eventType.Kind() == reflect.Interface {
-		eventType = nil
-	}
-
-	return eventType
-}
-
-// AddHandler allows you to add an event handler that will be fired anytime
-// the Discord WSAPI event that matches the interface fires.
-// eventToInterface in events.go has a list of all the Discord WSAPI events
-// and their respective interface.
-// eg:
-//     Session.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
-//     })
-//
-// or:
-//     Session.AddHandler(func(s *discordgo.Session, m *discordgo.PresenceUpdate) {
-//     })
-// The return value of this method is a function, that when called will remove the
-// event handler.
-func (s *Session) AddHandler(handler interface{}) func() {
-
-	s.initialize()
-
-	eventType := s.validateHandler(handler)
-
-	s.handlersMu.Lock()
-	defer s.handlersMu.Unlock()
-
-	h := reflect.ValueOf(handler)
-
-	s.handlers[eventType] = append(s.handlers[eventType], h)
-
-	// This must be done as we need a consistent reference to the
-	// reflected value, otherwise a RemoveHandler method would have
-	// been nice.
-	return func() {
-		s.handlersMu.Lock()
-		defer s.handlersMu.Unlock()
-
-		handlers := s.handlers[eventType]
-		for i, v := range handlers {
-			if h == v {
-				s.handlers[eventType] = append(handlers[:i], handlers[i+1:]...)
-				return
-			}
-		}
-	}
-}
-
-// handle calls any handlers that match the event type and any handlers of
-// interface{}.
-func (s *Session) handle(event interface{}) {
-
-	s.handlersMu.RLock()
-	defer s.handlersMu.RUnlock()
-
-	if s.handlers == nil {
-		return
-	}
-
-	handlerParameters := []reflect.Value{reflect.ValueOf(s), reflect.ValueOf(event)}
-
-	if handlers, ok := s.handlers[nil]; ok {
-		for _, handler := range handlers {
-			handler.Call(handlerParameters)
-		}
-	}
-
-	if handlers, ok := s.handlers[reflect.TypeOf(event)]; ok {
-		for _, handler := range handlers {
-			handler.Call(handlerParameters)
-		}
-	}
-}
-
-// initialize adds all internal handlers and state tracking handlers.
-func (s *Session) initialize() {
-
-	s.handlersMu.Lock()
-	if s.handlers != nil {
-		s.handlersMu.Unlock()
-		return
-	}
-
-	s.handlers = map[interface{}][]reflect.Value{}
-	s.handlersMu.Unlock()
-
-	s.AddHandler(s.onReady)
-	s.AddHandler(s.onVoiceServerUpdate)
-	s.AddHandler(s.onVoiceStateUpdate)
-	s.AddHandler(s.State.onInterface)
-}
-
-// onReady handles the ready event.
-func (s *Session) onReady(se *Session, r *Ready) {
-
-	go s.heartbeat(s.wsConn, s.listening, r.HeartbeatInterval)
 }

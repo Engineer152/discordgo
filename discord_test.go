@@ -1,8 +1,10 @@
 package discordgo
 
 import (
+	"fmt"
 	"os"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -10,65 +12,29 @@ import (
 //////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////// VARS NEEDED FOR TESTING
 var (
-	dg *Session // Stores global discordgo session
+	dg    *Session // Stores a global discordgo user session
+	dgBot *Session // Stores a global discordgo bot session
 
-	envToken    = os.Getenv("DG_TOKEN")    // Token to use when authenticating
-	envEmail    = os.Getenv("DG_EMAIL")    // Email to use when authenticating
-	envPassword = os.Getenv("DG_PASSWORD") // Password to use when authenticating
-	//	envGuild    = os.Getenv("DG_GUILD")    // Guild ID to use for tests
-	envChannel = os.Getenv("DG_CHANNEL") // Channel ID to use for tests
-	//	envUser     = os.Getenv("DG_USER")     // User ID to use for tests
-	envAdmin = os.Getenv("DG_ADMIN") // User ID of admin user to use for tests
+	envToken    = os.Getenv("DGU_TOKEN")  // Token to use when authenticating the user account
+	envBotToken = os.Getenv("DGB_TOKEN")  // Token to use when authenticating the bot account
+	envGuild    = os.Getenv("DG_GUILD")   // Guild ID to use for tests
+	envChannel  = os.Getenv("DG_CHANNEL") // Channel ID to use for tests
+	envAdmin    = os.Getenv("DG_ADMIN")   // User ID of admin user to use for tests
 )
 
 func init() {
-	if envEmail == "" || envPassword == "" || envToken == "" {
-		return
+	fmt.Println("Init is being called.")
+	if envBotToken != "" {
+		if d, err := New(envBotToken); err == nil {
+			dgBot = d
+		}
 	}
 
-	if d, err := New(envEmail, envPassword, envToken); err == nil {
+	if d, err := New(envToken); err == nil {
 		dg = d
+	} else {
+		fmt.Println("dg is nil, error", err)
 	}
-}
-
-//////////////////////////////////////////////////////////////////////////////
-//////////////////////////////////////////// HELPER FUNCTIONS USED FOR TESTING
-
-// This waits x time for the check bool to be the want bool
-func waitBoolEqual(timeout time.Duration, check *bool, want bool) bool {
-
-	start := time.Now()
-	for {
-		if *check == want {
-			return true
-		}
-
-		if time.Since(start) > timeout {
-			return false
-		}
-
-		runtime.Gosched()
-	}
-}
-
-// Checks if we're connected to Discord
-func isConnected() bool {
-
-	if dg == nil {
-		return false
-	}
-
-	if dg.Token == "" {
-		return false
-	}
-
-	// Need a way to see if the ws connection is nil
-
-	if !waitBoolEqual(10*time.Second, &dg.DataReady, true) {
-		return false
-	}
-
-	return true
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -98,58 +64,11 @@ func TestInvalidToken(t *testing.T) {
 	}
 }
 
-// TestInvalidUserPass tests the New() function with an invalid Email and Pass
-func TestInvalidEmailPass(t *testing.T) {
-
-	_, err := New("invalidemail", "invalidpassword")
-	if err == nil {
-		t.Errorf("New(InvalidEmail, InvalidPass) returned nil error.")
-	}
-
-}
-
-// TestInvalidPass tests the New() function with an invalid Password
-func TestInvalidPass(t *testing.T) {
-
-	if envEmail == "" {
-		t.Skip("Skipping New(username,InvalidPass), DG_EMAIL not set")
-		return
-	}
-	_, err := New(envEmail, "invalidpassword")
-	if err == nil {
-		t.Errorf("New(Email, InvalidPass) returned nil error.")
-	}
-}
-
-// TestNewUserPass tests the New() function with a username and password.
-// This should return a valid Session{}, a valid Session.Token.
-func TestNewUserPass(t *testing.T) {
-
-	if envEmail == "" || envPassword == "" {
-		t.Skip("Skipping New(username,password), DG_EMAIL or DG_PASSWORD not set")
-		return
-	}
-
-	d, err := New(envEmail, envPassword)
-	if err != nil {
-		t.Fatalf("New(user,pass) returned error: %+v", err)
-	}
-
-	if d == nil {
-		t.Fatal("New(user,pass), d is nil, should be Session{}")
-	}
-
-	if d.Token == "" {
-		t.Fatal("New(user,pass), d.Token is empty, should be a valid Token.")
-	}
-}
-
-// TestNewToken tests the New() function with a Token.  This should return
-// the same as the TestNewUserPass function.
+// TestNewToken tests the New() function with a Token.
 func TestNewToken(t *testing.T) {
 
 	if envToken == "" {
-		t.Skip("Skipping New(token), DG_TOKEN not set")
+		t.Skip("Skipping New(token), DGU_TOKEN not set")
 	}
 
 	d, err := New(envToken)
@@ -166,32 +85,9 @@ func TestNewToken(t *testing.T) {
 	}
 }
 
-// TestNewUserPassToken tests the New() function with a username, password and token.
-// This should return the same as the TestNewUserPass function.
-func TestNewUserPassToken(t *testing.T) {
-
-	if envEmail == "" || envPassword == "" || envToken == "" {
-		t.Skip("Skipping New(username,password,token), DG_EMAIL, DG_PASSWORD or DG_TOKEN not set")
-		return
-	}
-
-	d, err := New(envEmail, envPassword, envToken)
-	if err != nil {
-		t.Fatalf("New(user,pass,token) returned error: %+v", err)
-	}
-
-	if d == nil {
-		t.Fatal("New(user,pass,token), d is nil, should be Session{}")
-	}
-
-	if d.Token == "" {
-		t.Fatal("New(user,pass,token), d.Token is empty, should be a valid Token.")
-	}
-}
-
 func TestOpenClose(t *testing.T) {
 	if envToken == "" {
-		t.Skip("Skipping TestClose, DG_TOKEN not set")
+		t.Skip("Skipping TestClose, DGU_TOKEN not set")
 	}
 
 	d, err := New(envToken)
@@ -203,8 +99,21 @@ func TestOpenClose(t *testing.T) {
 		t.Fatalf("TestClose, d.Open failed: %+v", err)
 	}
 
-	if !waitBoolEqual(10*time.Second, &d.DataReady, true) {
-		t.Fatal("DataReady never became true.")
+	// We need a better way to know the session is ready for use,
+	// this is totally gross.
+	start := time.Now()
+	for {
+		d.RLock()
+		if d.DataReady {
+			d.RUnlock()
+			break
+		}
+		d.RUnlock()
+
+		if time.Since(start) > 10*time.Second {
+			t.Fatal("DataReady never became true.yy")
+		}
+		runtime.Gosched()
 	}
 
 	// TODO find a better way
@@ -216,7 +125,7 @@ func TestOpenClose(t *testing.T) {
 	// UpdateStatus - maybe we move this into wsapi_test.go but the websocket
 	// created here is needed.  This helps tests that the websocket was setup
 	// and it is working.
-	if err = d.UpdateStatus(0, time.Now().String()); err != nil {
+	if err = d.UpdateGameStatus(0, time.Now().String()); err != nil {
 		t.Errorf("UpdateStatus error: %+v", err)
 	}
 
@@ -226,19 +135,20 @@ func TestOpenClose(t *testing.T) {
 }
 
 func TestAddHandler(t *testing.T) {
-	testHandlerCalled := 0
+
+	testHandlerCalled := int32(0)
 	testHandler := func(s *Session, m *MessageCreate) {
-		testHandlerCalled++
+		atomic.AddInt32(&testHandlerCalled, 1)
 	}
 
-	interfaceHandlerCalled := 0
+	interfaceHandlerCalled := int32(0)
 	interfaceHandler := func(s *Session, i interface{}) {
-		interfaceHandlerCalled++
+		atomic.AddInt32(&interfaceHandlerCalled, 1)
 	}
 
-	bogusHandlerCalled := false
+	bogusHandlerCalled := int32(0)
 	bogusHandler := func(s *Session, se *Session) {
-		bogusHandlerCalled = true
+		atomic.AddInt32(&bogusHandlerCalled, 1)
 	}
 
 	d := Session{}
@@ -248,41 +158,46 @@ func TestAddHandler(t *testing.T) {
 	d.AddHandler(interfaceHandler)
 	d.AddHandler(bogusHandler)
 
-	d.handle(&MessageCreate{})
-	d.handle(&MessageDelete{})
+	d.handleEvent(messageCreateEventType, &MessageCreate{})
+	d.handleEvent(messageDeleteEventType, &MessageDelete{})
+
+	<-time.After(500 * time.Millisecond)
 
 	// testHandler will be called twice because it was added twice.
-	if testHandlerCalled != 2 {
+	if atomic.LoadInt32(&testHandlerCalled) != 2 {
 		t.Fatalf("testHandler was not called twice.")
 	}
 
 	// interfaceHandler will be called twice, once for each event.
-	if interfaceHandlerCalled != 2 {
+	if atomic.LoadInt32(&interfaceHandlerCalled) != 2 {
 		t.Fatalf("interfaceHandler was not called twice.")
 	}
 
-	if bogusHandlerCalled {
+	if atomic.LoadInt32(&bogusHandlerCalled) != 0 {
 		t.Fatalf("bogusHandler was called.")
 	}
 }
 
 func TestRemoveHandler(t *testing.T) {
-	testHandlerCalled := 0
+
+	testHandlerCalled := int32(0)
 	testHandler := func(s *Session, m *MessageCreate) {
-		testHandlerCalled++
+		atomic.AddInt32(&testHandlerCalled, 1)
 	}
 
 	d := Session{}
 	r := d.AddHandler(testHandler)
 
-	d.handle(&MessageCreate{})
+	d.handleEvent(messageCreateEventType, &MessageCreate{})
 
 	r()
 
-	d.handle(&MessageCreate{})
+	d.handleEvent(messageCreateEventType, &MessageCreate{})
+
+	<-time.After(500 * time.Millisecond)
 
 	// testHandler will be called once, as it was removed in between calls.
-	if testHandlerCalled != 1 {
+	if atomic.LoadInt32(&testHandlerCalled) != 1 {
 		t.Fatalf("testHandler was not called once.")
 	}
 }
